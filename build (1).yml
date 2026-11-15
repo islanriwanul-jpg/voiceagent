@@ -1,0 +1,659 @@
+name: Build Voice Agent APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Generate project files
+        run: |
+          mkdir -p app/src/main/java/com/example/voiceagent
+          mkdir -p app/src/main/res/xml
+          mkdir -p app/src/main/res/values
+
+          cat > settings.gradle.kts << 'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "VoiceAgent"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts << 'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat > app/build.gradle.kts << 'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.voiceagent"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.voiceagent"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <queries>
+                  <intent>
+                      <action android:name="android.speech.RecognitionService" />
+                  </intent>
+              </queries>
+              <application
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".AgentService"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/strings.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Voice Agent</string>
+              <string name="desc">AI ভয়েস এজেন্ট আপনার কথামতো ফোনের স্ক্রিন পড়বে ও ট্যাপ, টাইপ, স্ক্রল করবে।</string>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/xml/accessibility_config.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeAllMask"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault|flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
+              android:canRetrieveWindowContent="true"
+              android:canPerformGestures="true"
+              android:notificationTimeout="100"
+              android:description="@string/desc" />
+          EOF
+
+          cat > app/src/main/java/com/example/voiceagent/AgentService.kt << 'EOF'
+          package com.example.voiceagent
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.Rect
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import java.util.concurrent.CountDownLatch
+          import java.util.concurrent.TimeUnit
+
+          class AgentService : AccessibilityService() {
+
+              companion object {
+                  @Volatile
+                  var instance: AgentService? = null
+              }
+
+              private val nodes = ArrayList<AccessibilityNodeInfo>()
+
+              override fun onServiceConnected() {
+                  instance = this
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
+              override fun onInterrupt() {}
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  instance = null
+                  return super.onUnbind(intent)
+              }
+
+              fun readScreen(): String {
+                  nodes.clear()
+                  val root = rootInActiveWindow ?: return "(screen not readable)"
+                  val sb = StringBuilder()
+                  sb.append("current app: ").append(root.packageName).append("\n")
+                  walk(root, sb)
+                  return sb.toString().take(7000)
+              }
+
+              private fun walk(n: AccessibilityNodeInfo?, sb: StringBuilder) {
+                  if (n == null || nodes.size > 150) return
+                  val text = (n.text?.toString() ?: n.contentDescription?.toString() ?: "").trim()
+                  val interesting = text.isNotEmpty() || n.isClickable || n.isEditable
+                  if (n.isVisibleToUser && interesting) {
+                      nodes.add(n)
+                      sb.append("[").append(nodes.size - 1).append("] ")
+                      if (n.isEditable) sb.append("(input) ")
+                      if (n.isClickable) sb.append("(button) ")
+                      sb.append(text.take(80)).append("\n")
+                  }
+                  for (i in 0 until n.childCount) walk(n.getChild(i), sb)
+              }
+
+              fun installedApps(): List<String> {
+                  val pm = packageManager
+                  val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  return pm.queryIntentActivities(i, 0)
+                      .map { it.loadLabel(pm).toString() }
+                      .distinct().sorted().take(120)
+              }
+
+              fun openApp(name: String): Boolean {
+                  val q = name.lowercase().trim()
+                  if (q.isEmpty()) return false
+                  val pm = packageManager
+                  val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  val list = pm.queryIntentActivities(i, 0)
+                  val m = list.firstOrNull { it.loadLabel(pm).toString().lowercase() == q }
+                      ?: list.firstOrNull { it.loadLabel(pm).toString().lowercase().contains(q) }
+                      ?: return false
+                  val launch = pm.getLaunchIntentForPackage(m.activityInfo.packageName) ?: return false
+                  launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  startActivity(launch)
+                  return true
+              }
+
+              fun clickIndex(i: Int): Boolean {
+                  val n = nodes.getOrNull(i) ?: return false
+                  var c: AccessibilityNodeInfo? = n
+                  while (c != null && !c.isClickable) c = c.parent
+                  if (c != null && c.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+                  val r = Rect()
+                  n.getBoundsInScreen(r)
+                  val p = Path()
+                  p.moveTo(r.centerX().toFloat(), r.centerY().toFloat())
+                  return gesture(p, 60)
+              }
+
+              fun typeText(text: String, idx: Int): Boolean {
+                  val target = nodes.getOrNull(idx)?.takeIf { it.isEditable }
+                      ?: rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                      ?: nodes.firstOrNull { it.isEditable }
+                      ?: return false
+                  target.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                  val b = Bundle()
+                  b.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+                  return target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, b)
+              }
+
+              fun pressEnter(): Boolean {
+                  val t = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return false
+                  return if (Build.VERSION.SDK_INT >= 30) {
+                      t.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                  } else false
+              }
+
+              fun scroll(down: Boolean): Boolean {
+                  val dm = resources.displayMetrics
+                  val x = dm.widthPixels / 2f
+                  val a = dm.heightPixels * 0.75f
+                  val b = dm.heightPixels * 0.30f
+                  val p = Path()
+                  if (down) {
+                      p.moveTo(x, a); p.lineTo(x, b)
+                  } else {
+                      p.moveTo(x, b); p.lineTo(x, a)
+                  }
+                  return gesture(p, 400)
+              }
+
+              fun global(action: String): Boolean {
+                  val a = when (action) {
+                      "back" -> GLOBAL_ACTION_BACK
+                      "home" -> GLOBAL_ACTION_HOME
+                      else -> GLOBAL_ACTION_RECENTS
+                  }
+                  return performGlobalAction(a)
+              }
+
+              private fun gesture(path: Path, duration: Long): Boolean {
+                  val latch = CountDownLatch(1)
+                  val g = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0, duration))
+                      .build()
+                  val ok = dispatchGesture(g, object : AccessibilityService.GestureResultCallback() {
+                      override fun onCompleted(d: GestureDescription?) { latch.countDown() }
+                      override fun onCancelled(d: GestureDescription?) { latch.countDown() }
+                  }, null)
+                  if (ok) latch.await(3, TimeUnit.SECONDS)
+                  return ok
+              }
+
+              fun askConfirm(msg: String): Boolean {
+                  val latch = CountDownLatch(1)
+                  var answer = false
+                  var view: View? = null
+                  val c = this
+                  val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  Handler(Looper.getMainLooper()).post {
+                      val tv = TextView(c)
+                      tv.text = msg
+                      tv.textSize = 18f
+                      tv.setTextColor(Color.WHITE)
+                      tv.setPadding(40, 40, 40, 20)
+                      val yes = Button(c)
+                      yes.text = "হ্যাঁ"
+                      val no = Button(c)
+                      no.text = "না"
+                      val row = LinearLayout(c)
+                      row.orientation = LinearLayout.HORIZONTAL
+                      row.addView(yes, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                      row.addView(no, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                      val box = LinearLayout(c)
+                      box.orientation = LinearLayout.VERTICAL
+                      box.setBackgroundColor(Color.parseColor("#EE222222"))
+                      box.addView(tv)
+                      box.addView(row)
+                      view = box
+                      yes.setOnClickListener {
+                          answer = true
+                          try { wm.removeView(box) } catch (e: Exception) {}
+                          latch.countDown()
+                      }
+                      no.setOnClickListener {
+                          answer = false
+                          try { wm.removeView(box) } catch (e: Exception) {}
+                          latch.countDown()
+                      }
+                      val lp = WindowManager.LayoutParams(
+                          WindowManager.LayoutParams.MATCH_PARENT,
+                          WindowManager.LayoutParams.WRAP_CONTENT,
+                          WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                          PixelFormat.TRANSLUCENT
+                      )
+                      lp.gravity = Gravity.BOTTOM
+                      wm.addView(box, lp)
+                  }
+                  val done = latch.await(60, TimeUnit.SECONDS)
+                  if (!done) {
+                      Handler(Looper.getMainLooper()).post {
+                          try { view?.let { wm.removeView(it) } } catch (e: Exception) {}
+                      }
+                      return false
+                  }
+                  return answer
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/voiceagent/Agent.kt << 'EOF'
+          package com.example.voiceagent
+
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          class Agent(
+              private val apiKey: String,
+              private val log: (String) -> Unit,
+              private val say: (String) -> Unit
+          ) {
+              companion object {
+                  @Volatile
+                  var cancelled = false
+
+                  const val URL_STR =
+                      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+
+                  val SYSTEM = """You control an Android phone for the user. Each turn you get the user's command, the list of installed apps and the current screen as a numbered list. Items marked (button) are clickable, items marked (input) are text fields.
+          Reply with ONLY one JSON object with these fields:
+          action: one of open_app, click, type, enter, scroll, back, home, recents, wait, done
+          app: app name (for open_app, exactly as written in the installed apps list)
+          index: screen item number (for click, and optionally for type)
+          text: text to type (for type)
+          direction: down or up (for scroll)
+          say: a short message to the user in Bengali
+          confirm: true if you need the user's permission before doing this action
+          Rules:
+          - Do one small step at a time. After each action you will receive the new screen.
+          - Before any action that sends a message or email, posts something, pays, deletes, makes a call or installs, set confirm to true and ask the question in say.
+          - Do not use confirm for harmless actions such as opening apps, scrolling or typing.
+          - When the task is finished, or you only need to answer a question, use action done and put the answer in say.
+          - If you cannot do the task, use action done and explain in say.
+          - Never type passwords or payment details.
+          """
+              }
+
+              fun run(command: String) {
+                  cancelled = false
+                  val svc = AgentService.instance
+                  if (svc == null) {
+                      say("আগে সেটিংস থেকে অ্যাক্সেসিবিলিটি সার্ভিস চালু করুন।")
+                      return
+                  }
+                  val contents = JSONArray()
+                  fun add(role: String, text: String) {
+                      contents.put(
+                          JSONObject().put("role", role)
+                              .put("parts", JSONArray().put(JSONObject().put("text", text)))
+                      )
+                  }
+                  add(
+                      "user",
+                      "Command: " + command + "\nInstalled apps: " + svc.installedApps().joinToString(", ") +
+                          "\nCurrent screen:\n" + svc.readScreen()
+                  )
+                  for (step in 1..15) {
+                      if (cancelled) { say("থামালাম।"); return }
+                      val reply = try {
+                          callGemini(contents)
+                      } catch (e: Exception) {
+                          say("সমস্যা হয়েছে: " + e.message)
+                          return
+                      }
+                      add("model", reply)
+                      val j = try {
+                          JSONObject(reply)
+                      } catch (e: Exception) {
+                          say("উত্তর বুঝতে পারিনি।")
+                          return
+                      }
+                      val action = j.optString("action")
+                      val msg = j.optString("say", "")
+                      if (j.optBoolean("confirm", false)) {
+                          val q = if (msg.isEmpty()) "এটা করব?" else msg
+                          say(q)
+                          val ok = svc.askConfirm(q)
+                          if (!ok) { say("ঠিক আছে, বাতিল করলাম।"); return }
+                      } else if (msg.isNotEmpty() && action != "done") {
+                          log("• " + msg)
+                      }
+                      var result: String
+                      when (action) {
+                          "open_app" -> {
+                              val app = j.optString("app")
+                              result = if (svc.openApp(app)) "opened " + app else "app not found: " + app
+                          }
+                          "click" -> result = if (svc.clickIndex(j.optInt("index", -1))) "clicked" else "click failed"
+                          "type" -> result = if (svc.typeText(j.optString("text"), j.optInt("index", -1))) "typed" else "no input field found"
+                          "enter" -> result = if (svc.pressEnter()) "enter pressed" else "enter failed"
+                          "scroll" -> result = if (svc.scroll(j.optString("direction") != "up")) "scrolled" else "scroll failed"
+                          "back", "home", "recents" -> result = if (svc.global(action)) "done" else "failed"
+                          "wait" -> result = "waited"
+                          "done" -> {
+                              say(if (msg.isEmpty()) "কাজ শেষ।" else msg)
+                              return
+                          }
+                          else -> result = "unknown action"
+                      }
+                      Thread.sleep(1500)
+                      add("user", "Result: " + result + "\nCurrent screen:\n" + svc.readScreen())
+                  }
+                  say("অনেক ধাপ হয়ে গেছে, তাই থামলাম।")
+              }
+
+              private fun callGemini(contents: JSONArray): String {
+                  val body = JSONObject()
+                      .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYSTEM))))
+                      .put("contents", contents)
+                      .put(
+                          "generationConfig",
+                          JSONObject().put("responseMimeType", "application/json")
+                              .put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
+                      )
+                  val c = URL(URL_STR).openConnection() as HttpURLConnection
+                  c.requestMethod = "POST"
+                  c.connectTimeout = 20000
+                  c.readTimeout = 60000
+                  c.doOutput = true
+                  c.setRequestProperty("Content-Type", "application/json")
+                  c.setRequestProperty("x-goog-api-key", apiKey)
+                  c.outputStream.use { it.write(body.toString().toByteArray()) }
+                  val code = c.responseCode
+                  val stream = if (code in 200..299) c.inputStream else c.errorStream
+                  val text = stream.bufferedReader().use { it.readText() }
+                  if (code !in 200..299) throw Exception("HTTP " + code + ": " + text.take(200))
+                  val t = JSONObject(text).getJSONArray("candidates").getJSONObject(0)
+                      .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
+                  return t.trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/voiceagent/MainActivity.kt << 'EOF'
+          package com.example.voiceagent
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.speech.tts.TextToSpeech
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import java.util.Locale
+
+          class MainActivity : Activity() {
+
+              private var tts: TextToSpeech? = null
+              private var recognizer: SpeechRecognizer? = null
+              private lateinit var logView: TextView
+              private lateinit var keyBox: EditText
+              private lateinit var cmdBox: EditText
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences("p", MODE_PRIVATE)
+                  tts = TextToSpeech(this) { s ->
+                      if (s == TextToSpeech.SUCCESS) tts?.setLanguage(Locale("bn", "BD"))
+                  }
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(40, 80, 40, 40)
+
+                  val title = TextView(this)
+                  title.text = "Voice Agent"
+                  title.textSize = 24f
+                  root.addView(title)
+
+                  keyBox = EditText(this)
+                  keyBox.hint = "Gemini API Key"
+                  keyBox.setSingleLine(true)
+                  keyBox.setText(prefs.getString("key", ""))
+                  root.addView(keyBox)
+
+                  fun btn(label: String, onClick: () -> Unit) {
+                      val b = Button(this)
+                      b.text = label
+                      b.setOnClickListener { onClick() }
+                      root.addView(b)
+                  }
+
+                  btn("কী সেভ করুন") {
+                      prefs.edit().putString("key", keyBox.text.toString().trim()).apply()
+                      log("সেভ হয়েছে।")
+                  }
+                  btn("অ্যাক্সেসিবিলিটি সেটিংস খুলুন") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  }
+                  btn("🎤 কথা বলুন") {
+                      prefs.edit().putString("key", keyBox.text.toString().trim()).apply()
+                      startListening()
+                  }
+
+                  cmdBox = EditText(this)
+                  cmdBox.hint = "অথবা এখানে কমান্ড লিখুন"
+                  root.addView(cmdBox)
+
+                  btn("পাঠান") {
+                      prefs.edit().putString("key", keyBox.text.toString().trim()).apply()
+                      val t = cmdBox.text.toString().trim()
+                      if (t.isNotEmpty()) {
+                          log("🗣 " + t)
+                          runCommand(t)
+                      }
+                  }
+                  btn("⛔ থামুন") {
+                      Agent.cancelled = true
+                      log("থামানোর অনুরোধ দেওয়া হয়েছে।")
+                  }
+
+                  logView = TextView(this)
+                  logView.textSize = 16f
+                  logView.setPadding(0, 30, 0, 0)
+                  root.addView(logView)
+
+                  val sv = ScrollView(this)
+                  sv.addView(root)
+                  setContentView(sv)
+              }
+
+              private fun log(s: String) {
+                  runOnUiThread { logView.append(s + "\n\n") }
+              }
+
+              private fun say(s: String) {
+                  log("🤖 " + s)
+                  tts?.speak(s, TextToSpeech.QUEUE_ADD, null, "agent")
+              }
+
+              private fun runCommand(cmd: String) {
+                  val key = getSharedPreferences("p", MODE_PRIVATE).getString("key", "") ?: ""
+                  if (key.isEmpty()) {
+                      log("আগে Gemini API Key দিন।")
+                      return
+                  }
+                  val agent = Agent(key, { log(it) }, { say(it) })
+                  Thread { agent.run(cmd) }.start()
+              }
+
+              private fun startListening() {
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+                      return
+                  }
+                  if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                      log("এই ফোনে স্পিচ রিকগনিশন পাওয়া যায়নি।")
+                      return
+                  }
+                  recognizer?.destroy()
+                  val r = SpeechRecognizer.createSpeechRecognizer(this)
+                  recognizer = r
+                  r.setRecognitionListener(object : RecognitionListener {
+                      override fun onReadyForSpeech(params: Bundle?) { log("শুনছি...") }
+                      override fun onBeginningOfSpeech() {}
+                      override fun onRmsChanged(rmsdB: Float) {}
+                      override fun onBufferReceived(buffer: ByteArray?) {}
+                      override fun onEndOfSpeech() {}
+                      override fun onError(error: Int) { log("শুনতে পারিনি (কোড " + error + ")") }
+                      override fun onPartialResults(partialResults: Bundle?) {}
+                      override fun onEvent(eventType: Int, params: Bundle?) {}
+                      override fun onResults(results: Bundle?) {
+                          val t = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                          if (t != null) {
+                              log("🗣 " + t)
+                              runCommand(t)
+                          }
+                      }
+                  })
+                  val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                  i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                  i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "bn-BD")
+                  r.startListening(i)
+              }
+
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) startListening()
+              }
+          }
+          EOF
+
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Publish APK as a Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ github.run_number }}" app/build/outputs/apk/debug/app-debug.apk \
+            --title "Voice Agent v${{ github.run_number }}" \
+            --notes "Debug APK"
